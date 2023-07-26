@@ -2,11 +2,12 @@
 
 #include "rom/ets_sys.h"
 #include "driver/gpio.h"
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
 #include "esp_log.h"
 #include "esp_timer.h"
 
 /* Log TAG */
-static const char* TAG      = "softserial";
+const char* TAG_SOFTSERIAL = "softserial";
 
 static int64_t TMAX = 0x7fffffffffffffff;
 
@@ -21,15 +22,15 @@ static uint8_t numinstances = 0;
 static esp_err_t check_pins(uint32_t out_pbm, uint32_t in_pbm)
 {
     if (in_pbm & out_pbm) {
-        ESP_LOGE(TAG, "TX pin(s) and RX pin must not be the same");
+        ESP_LOGE(TAG_SOFTSERIAL, "TX pin(s) and RX pin must not be the same");
         return ESP_ERR_INVALID_ARG;
     }
     if (used_pins & out_pbm) {
-        ESP_LOGE(TAG, "TX pin(s) already in use");
+        ESP_LOGE(TAG_SOFTSERIAL, "TX pin(s) already in use");
         return ESP_ERR_INVALID_ARG;
     }
     if (used_pins & in_pbm) {
-        ESP_LOGE(TAG, "RX pin already in use");
+        ESP_LOGE(TAG_SOFTSERIAL, "RX pin already in use");
         return ESP_ERR_INVALID_ARG;
     }
     used_pins |= (in_pbm | out_pbm);
@@ -83,10 +84,21 @@ static void softserial_isr(void* arg)
             s->buffer.overrun = 1;
         }
         // Wait for stop bit
-        os_delay_us(s->bit_time);
+        os_delay_us(s->bit_time / 2);
+        if (data == '\n') {
+            if (s->event_group && s->rx_event) {
+                BaseType_t higherTaskWoken = pdFALSE;
+                BaseType_t r = xEventGroupSetBitsFromISR(s->event_group, s->rx_event, &higherTaskWoken);
+                if (r == pdTRUE && pdTRUE == higherTaskWoken) {
+                    // Yield to a different task after ISR ends.
+                    portYIELD_FROM_ISR();
+                }
+            }
+        }
     }
+
     // Reactivate interrupts for RX pin
-    gpio_set_intr_type(s->rx_pin, GPIO_INTR_ANYEDGE);
+    gpio_set_intr_type(s->rx_pin, GPIO_INTR_NEGEDGE);
 }
 
 esp_err_t softserial_init(softserial* s)
@@ -105,10 +117,10 @@ esp_err_t softserial_init(softserial* s)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_ANYEDGE,
+        .intr_type = GPIO_INTR_NEGEDGE,
     };
-    if (s->use_rs485) {
-        tx_gpio_conf.pin_bit_mask |= (1ULL << s->rs485_tx_enable_pin);
+    if (s->features & SOFTSERIAL_USE_RS485) {
+        tx_gpio_conf.pin_bit_mask |= (1ULL << s->rs485_pin);
     }
     ret = check_pins(tx_gpio_conf.pin_bit_mask, rx_gpio_conf.pin_bit_mask);
     if (ESP_OK != ret) {
@@ -117,49 +129,67 @@ esp_err_t softserial_init(softserial* s)
 
     // Set bit time
     if (s->baudrate <= 0) {
-        ESP_LOGE(TAG, "Invalid baud rate (%d)", s->baudrate);
+        ESP_LOGE(TAG_SOFTSERIAL, "Invalid baud rate (%d)", s->baudrate);
         return ESP_ERR_INVALID_ARG;
     }
     else {
         s->bit_time = (1000000 / s->baudrate);
-        if ( ((100000000 / s->baudrate) - (100 * s->bit_time)) > 50 ) {
+        if (((100000000 / s->baudrate) - (100 * s->bit_time)) > 50) {
             s->bit_time++;
         }
-        ESP_LOGD(TAG, "bit_time is %d", s->bit_time);
+        ESP_LOGD(TAG_SOFTSERIAL, "bit_time is %d", s->bit_time);
     }
 
     if (0 == numinstances) {
         ret = gpio_install_isr_service(0);
-        if (ret) {
+        // ESP_ERR_INVALID_STATE means already installed,
+        // which is harmless.
+        if (ESP_OK != ret && ESP_ERR_INVALID_STATE != ret) {
             return ret;
         }
     }
     numinstances++;
 
-    // Init TX pin and RS485 TX enable pin
-    ESP_LOGD(TAG, "TX init");
-    ret = gpio_config(&tx_gpio_conf);
-    if (ESP_OK != ret) {
-        ESP_LOGE(TAG, "Invalid TX setup");
-        return ret;
+    if (s->features & SOFTSERIAL_USE_TX) {
+        // Init TX pin and possibly RS485 TX enable pin
+        ESP_LOGD(TAG_SOFTSERIAL, "TX init");
+        ret = gpio_config(&tx_gpio_conf);
+        if (ESP_OK != ret) {
+            ESP_LOGE(TAG_SOFTSERIAL, "Invalid TX setup");
+            return ret;
+        }
+        ESP_LOGD(TAG_SOFTSERIAL, "TX init done");
     }
-    ESP_LOGD(TAG, "TX init done");
 
-    // Init RX pin
-    ret = gpio_config(&rx_gpio_conf);
-    if (ESP_OK != ret) {
-        ESP_LOGE(TAG, "Invalid RX setup");
-        return ret;
+    if (s->features & SOFTSERIAL_USE_RX) {
+        // Init RX pin
+        ESP_LOGD(TAG_SOFTSERIAL, "RX init");
+        ret = gpio_config(&rx_gpio_conf);
+        if (ESP_OK != ret) {
+            ESP_LOGE(TAG_SOFTSERIAL, "Invalid RX setup");
+            return ret;
+        }
+        ESP_LOGD(TAG_SOFTSERIAL, "RX init done");
+        // Register ISR
+        ESP_LOGD(TAG_SOFTSERIAL, "register ISR");
+        ret = gpio_isr_handler_add(s->rx_pin, softserial_isr, (void *)s);
+        if (ESP_OK != ret) {
+            ESP_LOGE(TAG_SOFTSERIAL, "Failed to add ISR handler");
+            return ret;
+        }
     }
-    ESP_LOGD(TAG, "RX init done");
-
-    // Register isr_handler
-    ret = gpio_isr_handler_add(s->rx_pin, softserial_isr, (void *)s);
-    if (ESP_OK != ret) {
-        ESP_LOGE(TAG, "Failed to add ISR handler");
-        return ret;
-    }
-    ESP_LOGD(TAG, "init done");
+    char *rx_txt, *tx_txt, *rs485_txt;
+    rx_txt = tx_txt = rs485_txt = NULL;
+    asprintf(&rx_txt, (s->features & SOFTSERIAL_USE_RX) ?
+            "RX enabled on GPIO%d" : "RX disabled", s->rx_pin);
+    asprintf(&tx_txt, (s->features & SOFTSERIAL_USE_TX) ?
+            "TX enabled on GPIO%d" : "TX disabled", s->tx_pin);
+    asprintf(&rs485_txt, (s->features & SOFTSERIAL_USE_RS485) ?
+            "RS485 enabled on GPIO%d" : "RS485 disabled", s->rs485_pin);
+    ESP_LOGI(TAG_SOFTSERIAL, "initialized. %s, %s, %s", rx_txt, tx_txt, rs485_txt);
+    free(rx_txt);
+    free(tx_txt);
+    free(rs485_txt);
     return ESP_OK;
 }
 
@@ -200,9 +230,9 @@ esp_err_t softserial_putchar(softserial* s, uint8_t data)
     unsigned i;
     int64_t start_time = TMAX & esp_timer_get_time();
 
-    if (s->use_rs485) {
+    if (s->features & SOFTSERIAL_USE_RS485) {
         // TX enable
-        ret = gpio_set_level(s->rs485_tx_enable_pin, 1);
+        ret = gpio_set_level(s->rs485_pin, 1);
         if (ESP_OK != ret) {
             return ret;
         }
@@ -241,9 +271,9 @@ esp_err_t softserial_putchar(softserial* s, uint8_t data)
     // Delay after byte, for new sync
     os_delay_us(s->bit_time * 6);
 
-    if (s->use_rs485) {
+    if (s->features & SOFTSERIAL_USE_RS485) {
         // TX disable
-        ret = gpio_set_level(s->rs485_tx_enable_pin, 0);
+        ret = gpio_set_level(s->rs485_pin, 0);
         if (ESP_OK != ret) {
             return ret;
         }
@@ -271,7 +301,7 @@ uint8_t softserial_overrun(softserial *s)
     return ret;
 }
 
-static inline size_t read_internal(softserial* s, uint8_t* buffer, size_t maxlen, uint8_t checklf)
+static inline ssize_t read_internal(softserial* s, uint8_t* buffer, size_t maxlen, uint8_t checklf)
 {
     uint8_t ch;
     size_t len = 0;
@@ -299,12 +329,12 @@ static inline size_t read_internal(softserial* s, uint8_t* buffer, size_t maxlen
     return len;
 }
 
-size_t softserial_readline(softserial* s, uint8_t* buffer, size_t maxlen)
+ssize_t softserial_readline(softserial* s, uint8_t* buffer, size_t maxlen)
 {
     return read_internal(s, buffer, maxlen, 1);
 }
 
-size_t softserial_read(softserial* s, uint8_t* buffer, size_t maxlen)
+ssize_t softserial_read(softserial* s, uint8_t* buffer, size_t maxlen)
 {
     return read_internal(s, buffer, maxlen, 0);
 }
